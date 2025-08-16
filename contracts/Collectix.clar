@@ -12,10 +12,16 @@
 (define-constant ERR_BID_TOO_LOW (err u110))
 (define-constant ERR_NOT_HIGHEST_BIDDER (err u111))
 (define-constant ERR_AUCTION_NOT_ENDED (err u112))
+(define-constant ERR_BUNDLE_NOT_FOUND (err u113))
+(define-constant ERR_BUNDLE_EMPTY (err u114))
+(define-constant ERR_BUNDLE_TOO_LARGE (err u115))
+(define-constant ERR_COLLECTIBLE_IN_BUNDLE (err u116))
+(define-constant ERR_BUNDLE_NOT_FOR_SALE (err u117))
 
 (define-data-var next-collectible-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
 (define-data-var next-auction-id uint u1)
+(define-data-var next-bundle-id uint u1)
 
 (define-map collectibles
   { id: uint }
@@ -76,6 +82,231 @@
   { user: principal }
   { count: uint }
 )
+
+(define-map bundles
+  { id: uint }
+  {
+    creator: principal,
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    collectible-ids: (list 10 uint),
+    total-price: uint,
+    for-sale: bool,
+    created-at: uint
+  }
+)
+
+(define-map bundle-collectibles
+  { bundle-id: uint, collectible-id: uint }
+  { included: bool }
+)
+
+(define-map user-bundle-counts
+  { user: principal }
+  { count: uint }
+)
+
+(define-public (create-bundle 
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (collectible-ids (list 10 uint))
+  (total-price uint))
+  (let
+    (
+      (bundle-id (var-get next-bundle-id))
+      (creator tx-sender)
+      (collectible-count (len collectible-ids))
+    )
+    (asserts! (> collectible-count u0) ERR_BUNDLE_EMPTY)
+    (asserts! (<= collectible-count u10) ERR_BUNDLE_TOO_LARGE)
+    (asserts! (> total-price u0) ERR_INVALID_PRICE)
+    (try! (validate-bundle-ownership creator collectible-ids))
+    
+    (map-set bundles
+      { id: bundle-id }
+      {
+        creator: creator,
+        name: name,
+        description: description,
+        collectible-ids: collectible-ids,
+        total-price: total-price,
+        for-sale: true,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (try! (mark-collectibles-bundled bundle-id collectible-ids))
+    (update-user-bundle-count creator 1)
+    (var-set next-bundle-id (+ bundle-id u1))
+    (ok bundle-id)
+  )
+)
+
+(define-public (buy-bundle (bundle-id uint))
+  (let
+    (
+      (bundle (unwrap! (map-get? bundles { id: bundle-id }) ERR_BUNDLE_NOT_FOUND))
+      (buyer tx-sender)
+      (seller (get creator bundle))
+      (price (get total-price bundle))
+      (platform-fee (/ (* price (var-get platform-fee-percentage)) u10000))
+      (seller-amount (- price platform-fee))
+      (buyer-balance (get-user-balance buyer))
+      (collectible-ids (get collectible-ids bundle))
+    )
+    (asserts! (get for-sale bundle) ERR_BUNDLE_NOT_FOR_SALE)
+    (asserts! (not (is-eq buyer seller)) ERR_SELF_TRANSFER)
+    (asserts! (>= buyer-balance price) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (execute-bundle-transfers seller buyer collectible-ids))
+    (try! (unmark-collectibles-bundled bundle-id collectible-ids))
+    
+    (map-set bundles
+      { id: bundle-id }
+      (merge bundle { creator: buyer, for-sale: false })
+    )
+    
+    (update-user-balance buyer (- buyer-balance price))
+    (update-user-balance seller (+ (get-user-balance seller) seller-amount))
+    
+    (update-user-bundle-count seller (- 1))
+    (update-user-bundle-count buyer 1)
+    
+    (ok true)
+  )
+)
+
+(define-public (disband-bundle (bundle-id uint))
+  (let
+    (
+      (bundle (unwrap! (map-get? bundles { id: bundle-id }) ERR_BUNDLE_NOT_FOUND))
+      (caller tx-sender)
+      (collectible-ids (get collectible-ids bundle))
+    )
+    (asserts! (is-eq caller (get creator bundle)) ERR_NOT_OWNER)
+    
+    (try! (unmark-collectibles-bundled bundle-id collectible-ids))
+    (map-delete bundles { id: bundle-id })
+    (update-user-bundle-count caller (- 1))
+    (ok true)
+  )
+)
+
+(define-public (set-bundle-for-sale (bundle-id uint) (for-sale bool) (new-price uint))
+  (let
+    (
+      (bundle (unwrap! (map-get? bundles { id: bundle-id }) ERR_BUNDLE_NOT_FOUND))
+      (caller tx-sender)
+    )
+    (asserts! (is-eq caller (get creator bundle)) ERR_NOT_OWNER)
+    (asserts! (or (not for-sale) (> new-price u0)) ERR_INVALID_PRICE)
+    
+    (map-set bundles
+      { id: bundle-id }
+      (merge bundle { for-sale: for-sale, total-price: new-price })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-bundle (bundle-id uint))
+  (map-get? bundles { id: bundle-id })
+)
+
+(define-read-only (get-user-bundle-count (user principal))
+  (default-to u0 (get count (map-get? user-bundle-counts { user: user })))
+)
+
+(define-read-only (get-next-bundle-id)
+  (var-get next-bundle-id)
+)
+
+(define-read-only (is-collectible-in-bundle (collectible-id uint))
+  (default-to false (get included (map-get? bundle-collectibles { bundle-id: u1, collectible-id: collectible-id })))
+)
+
+(define-private (validate-bundle-ownership (owner principal) (collectible-ids (list 10 uint)))
+  (fold check-collectible-ownership collectible-ids (ok true))
+)
+
+(define-private (check-collectible-ownership (collectible-id uint) (prev-result (response bool uint)))
+  (match prev-result
+    success
+    (if (owns-collectible tx-sender collectible-id)
+      (ok true)
+      ERR_NOT_OWNER)
+    error
+    (err error)
+  )
+)
+
+(define-private (mark-collectibles-bundled (bundle-id uint) (collectible-ids (list 10 uint)))
+  (fold mark-collectible-bundled collectible-ids (ok bundle-id))
+)
+
+(define-private (mark-collectible-bundled (collectible-id uint) (prev-result (response uint uint)))
+  (match prev-result
+    success
+    (begin
+      (map-set bundle-collectibles
+        { bundle-id: success, collectible-id: collectible-id }
+        { included: true }
+      )
+      (ok success)
+    )
+    error
+    (err error)
+  )
+)
+
+(define-private (unmark-collectibles-bundled (bundle-id uint) (collectible-ids (list 10 uint)))
+  (fold unmark-collectible-bundled collectible-ids (ok bundle-id))
+)
+
+(define-private (unmark-collectible-bundled (collectible-id uint) (prev-result (response uint uint)))
+  (match prev-result
+    success
+    (begin
+      (map-delete bundle-collectibles { bundle-id: success, collectible-id: collectible-id })
+      (ok success)
+    )
+    error
+    (err error)
+  )
+)
+
+(define-private (execute-bundle-transfers (from principal) (to principal) (collectible-ids (list 10 uint)))
+  (fold process-collectible-transfer collectible-ids (ok { from: from, to: to }))
+)
+
+(define-private (process-collectible-transfer (collectible-id uint) (prev-result (response { from: principal, to: principal } uint)))
+  (match prev-result
+    success
+    (begin
+      (transfer-collectible-ownership collectible-id (get from success) (get to success))
+      (ok success)
+    )
+    error
+    (err error)
+  )
+)
+
+(define-private (update-user-bundle-count (user principal) (change int))
+  (let
+    (
+      (current-count (get-user-bundle-count user))
+      (new-count (if (> change 0)
+                    (+ current-count (to-uint change))
+                    (- current-count (to-uint (- change)))))
+    )
+    (map-set user-bundle-counts
+      { user: user }
+      { count: new-count }
+    )
+  )
+)
+
+
 
 (define-public (create-collectible 
   (name (string-ascii 64))
@@ -521,3 +752,7 @@
     )
   )
 )
+
+
+
+
